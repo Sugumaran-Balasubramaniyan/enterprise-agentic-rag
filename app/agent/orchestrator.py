@@ -396,3 +396,249 @@ class AgentOrchestrator:
             guardrail_metrics=guardrail_metrics,
             latency_ms=round(total_latency, 2)
         )
+
+    async def execute_stream(
+        self,
+        query: str,
+        user_role: str = "standard_user",
+        max_steps: Optional[int] = None
+    ):
+        """
+        Streaming execution generator yielding structured SSE event dictionaries.
+        """
+        start_time = time.perf_counter()
+        effective_max_steps = max_steps or self.max_steps
+        traces: List[ToolExecutionTrace] = []
+        reasoning_steps: List[str] = []
+        retrieved_sources: List[Dict[str, Any]] = []
+        calc_results: List[Dict[str, Any]] = []
+        verification_metric: Dict[str, Any] = {}
+
+        # 1. Pre-Execution Guardrail
+        is_safe, violation_reason = PreExecutionGuardrail.inspect(query)
+        if not is_safe:
+            latency = (time.perf_counter() - start_time) * 1000
+            blocked_payload = {
+                "answer": f"Request blocked by Enterprise Guardrail: {violation_reason}",
+                "sources": [],
+                "reasoning_steps": ["Pre-execution security validation failed: malicious or adversarial input."],
+                "tool_traces": [],
+                "guardrail_metrics": {"blocked": True, "reason": violation_reason, "pre_execution_passed": False},
+                "latency_ms": round(latency, 2)
+            }
+            yield {"event": "blocked", "data": blocked_payload}
+            yield {"event": "done", "data": {"status": "blocked", **blocked_payload}}
+            return
+
+        step_msg = "Pre-execution security validation passed."
+        reasoning_steps.append(step_msg)
+        yield {"event": "reasoning_step", "data": {"step": step_msg}}
+
+        # 2. Intent Classification
+        intent = self.classify_intent(query, user_role=user_role)
+        capabilities = []
+        if intent["needs_retrieval"]:
+            capabilities.append("Retrieval" + (" (Hybrid RRF)" if intent["needs_hybrid"] else " (Dense)"))
+        if intent["needs_calculation"]:
+            capabilities.append("Calculator")
+        if intent["needs_verification"]:
+            capabilities.append("Citation Verification")
+
+        intent_msg = f"Intent classified: required capabilities -> [{', '.join(capabilities)}]."
+        reasoning_steps.append(intent_msg)
+        yield {"event": "reasoning_step", "data": {"step": intent_msg}}
+
+        # 3. Autonomous Multi-Step Execution Loop
+        step = 0
+        executed_actions = set()
+
+        while step < effective_max_steps:
+            step += 1
+
+            # Step Action A: Retrieval
+            if intent["needs_retrieval"] and "retrieval" not in executed_actions:
+                plan_msg = (
+                    f"Step {step}: Planning vector retrieval "
+                    f"(Hybrid={intent['needs_hybrid']}, Dept='{intent['department'] or 'All'}')."
+                )
+                reasoning_steps.append(plan_msg)
+                yield {"event": "reasoning_step", "data": {"step": plan_msg}}
+
+                t0 = time.perf_counter()
+                search_res = await self.vector_tool.execute(
+                    query=query,
+                    limit=3,
+                    department=intent["department"],
+                    use_hybrid=intent["needs_hybrid"]
+                )
+                retrieval_lat = (time.perf_counter() - t0) * 1000
+
+                trace = ToolExecutionTrace(
+                    tool_name=self.vector_tool.name,
+                    arguments={
+                        "query": query,
+                        "limit": 3,
+                        "department": intent["department"],
+                        "use_hybrid": intent["needs_hybrid"]
+                    },
+                    output=search_res,
+                    latency_ms=round(retrieval_lat, 2)
+                )
+                traces.append(trace)
+                yield {
+                    "event": "tool_trace",
+                    "data": {
+                        "tool_name": trace.tool_name,
+                        "arguments": trace.arguments,
+                        "output": trace.output,
+                        "latency_ms": trace.latency_ms
+                    }
+                }
+
+                retrieved_sources = search_res.get("results", [])
+                executed_actions.add("retrieval")
+                ret_msg = (
+                    f"Retrieved {len(retrieved_sources)} relevant documentation chunks "
+                    f"via {search_res.get('search_type', 'vector')} search."
+                )
+                reasoning_steps.append(ret_msg)
+                yield {"event": "reasoning_step", "data": {"step": ret_msg}}
+                continue
+
+            # Step Action B: Calculator
+            if intent["needs_calculation"] and "calculator" not in executed_actions:
+                calc_expr, calc_kwargs = self._extract_calculation_params(query, retrieved_sources)
+                calc_plan = f"Step {step}: Dispatching calculator tool for mathematical/sizing parameters."
+                reasoning_steps.append(calc_plan)
+                yield {"event": "reasoning_step", "data": {"step": calc_plan}}
+
+                t0 = time.perf_counter()
+                calc_res = self.calc_tool.execute(expression=calc_expr, **calc_kwargs)
+                calc_lat = (time.perf_counter() - t0) * 1000
+
+                trace = ToolExecutionTrace(
+                    tool_name=self.calc_tool.name,
+                    arguments={"expression": calc_expr, **calc_kwargs},
+                    output=calc_res,
+                    latency_ms=round(calc_lat, 2)
+                )
+                traces.append(trace)
+                yield {
+                    "event": "tool_trace",
+                    "data": {
+                        "tool_name": trace.tool_name,
+                        "arguments": trace.arguments,
+                        "output": trace.output,
+                        "latency_ms": trace.latency_ms
+                    }
+                }
+
+                calc_results.append(calc_res)
+                executed_actions.add("calculator")
+                calc_done_msg = (
+                    f"Calculation complete: {calc_res.get('formatted', calc_res.get('result'))} "
+                    f"(Type: {calc_res.get('formula_type')})."
+                )
+                reasoning_steps.append(calc_done_msg)
+                yield {"event": "reasoning_step", "data": {"step": calc_done_msg}}
+                continue
+
+            # Step Action C: Response Synthesis and Citation Verification
+            if "synthesis" not in executed_actions:
+                raw_answer = self._synthesize_response(query, retrieved_sources, calc_results, intent)
+                synth_msg = "Synthesized draft response grounded in retrieved documentation and tool outputs."
+                reasoning_steps.append(synth_msg)
+                yield {"event": "reasoning_step", "data": {"step": synth_msg}}
+                executed_actions.add("synthesis")
+
+                if intent["needs_verification"] and retrieved_sources:
+                    verify_plan = f"Step {step}: Executing citation verifier to audit factual claims."
+                    reasoning_steps.append(verify_plan)
+                    yield {"event": "reasoning_step", "data": {"step": verify_plan}}
+
+                    t0 = time.perf_counter()
+                    verify_res = await self.verifier_tool.execute(answer=raw_answer, sources=retrieved_sources)
+                    verify_lat = (time.perf_counter() - t0) * 1000
+
+                    trace = ToolExecutionTrace(
+                        tool_name=self.verifier_tool.name,
+                        arguments={"total_claims": verify_res.get("total_claims", 0), "sources_count": len(retrieved_sources)},
+                        output=verify_res,
+                        latency_ms=round(verify_lat, 2)
+                    )
+                    traces.append(trace)
+                    yield {
+                        "event": "tool_trace",
+                        "data": {
+                            "tool_name": trace.tool_name,
+                            "arguments": trace.arguments,
+                            "output": trace.output,
+                            "latency_ms": trace.latency_ms
+                        }
+                    }
+
+                    verification_metric = verify_res
+                    executed_actions.add("verification")
+                    verify_done_msg = (
+                        f"Citation verification complete: {verify_res.get('summary')} "
+                        f"(Coverage: {verify_res.get('coverage')}, Precision: {verify_res.get('precision')})."
+                    )
+                    reasoning_steps.append(verify_done_msg)
+                    yield {"event": "reasoning_step", "data": {"step": verify_done_msg}}
+
+                break
+
+            break
+
+        if "synthesis" not in executed_actions:
+            raw_answer = self._synthesize_response(query, retrieved_sources, calc_results, intent)
+            max_msg = "Max execution steps reached; finalized synthesized response."
+            reasoning_steps.append(max_msg)
+            yield {"event": "reasoning_step", "data": {"step": max_msg}}
+
+        # 4. Post-Execution Guardrails
+        is_grounded, grounding_score = PostExecutionGuardrail.verify_factual_grounding(raw_answer, retrieved_sources)
+        sanitized_answer = PostExecutionGuardrail.sanitize_pii(raw_answer)
+        post_msg = f"Post-execution validation complete (Grounding Score: {grounding_score}, PII Sanitized: True)."
+        reasoning_steps.append(post_msg)
+        yield {"event": "reasoning_step", "data": {"step": post_msg}}
+
+        # Stream tokens
+        words = sanitized_answer.split(" ")
+        for i, word in enumerate(words):
+            token_chunk = word + (" " if i < len(words) - 1 else "")
+            yield {"event": "token", "data": {"token": token_chunk}}
+
+        total_latency = (time.perf_counter() - start_time) * 1000
+
+        guardrail_metrics = {
+            "pre_execution_passed": True,
+            "factual_grounding_score": grounding_score,
+            "is_grounded": is_grounded,
+            "pii_sanitized": True,
+        }
+        if verification_metric:
+            guardrail_metrics["citation_coverage"] = verification_metric.get("coverage", 1.0)
+            guardrail_metrics["citation_precision"] = verification_metric.get("precision", 1.0)
+            guardrail_metrics["citation_verified"] = verification_metric.get("verified", True)
+
+        yield {"event": "guardrail_metrics", "data": guardrail_metrics}
+        yield {
+            "event": "done",
+            "data": {
+                "answer": sanitized_answer,
+                "sources": retrieved_sources,
+                "reasoning_steps": reasoning_steps,
+                "tool_traces": [
+                    {
+                        "tool_name": t.tool_name,
+                        "arguments": t.arguments,
+                        "output": t.output,
+                        "latency_ms": t.latency_ms
+                    } for t in traces
+                ],
+                "guardrail_metrics": guardrail_metrics,
+                "latency_ms": round(total_latency, 2)
+            }
+        }
+

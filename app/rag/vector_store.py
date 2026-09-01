@@ -569,3 +569,54 @@ class PGVectorStore:
 
         return list(docs_summary.values())
 
+    async def get_document_chunks(self, document_id: str) -> List[Dict[str, Any]]:
+        """
+        Retrieves all chunks belonging to a document_id.
+        """
+        target_doc_id = str(document_id)
+        if self.is_postgres_active() and HAS_SQLALCHEMY and DocumentChunk is not None:
+            try:
+                async with self.session_factory() as session:
+                    stmt = select(DocumentChunk).where(DocumentChunk.document_id == target_doc_id)
+                    res = await session.execute(stmt)
+                    rows = res.scalars().all()
+                    if rows:
+                        return [
+                            {
+                                "id": r.id,
+                                "document_id": r.document_id,
+                                "content": r.content,
+                                "metadata": r.metadata_ or {}
+                            }
+                            for r in rows
+                        ]
+            except Exception:
+                self._postgres_available = False
+
+        # In-memory retrieval
+        return [
+            {
+                "id": c["id"],
+                "document_id": c["document_id"],
+                "content": c["content"],
+                "metadata": c.get("metadata", {})
+            }
+            for c in self._in_memory_chunks.values()
+            if str(c.get("document_id")) == target_doc_id
+        ]
+
+    async def get_total_chunk_count(self) -> int:
+        """
+        Returns total number of chunks indexed in the vector store.
+        """
+        if self.is_postgres_active() and HAS_SQLALCHEMY and DocumentChunk is not None:
+            try:
+                async with self.session_factory() as session:
+                    stmt = select(func.count(DocumentChunk.id))
+                    res = await session.execute(stmt)
+                    return res.scalar_one() or 0
+            except Exception:
+                self._postgres_available = False
+        return len(self._in_memory_chunks)
+
+
