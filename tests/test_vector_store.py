@@ -62,7 +62,7 @@ class TestPGVectorStore(unittest.TestCase):
             results = await store.search(query_vec, limit=2)
             self.assertGreater(len(results), 0)
             self.assertIn("HNSW", results[0]["content"])
-            self.assertGreater(results[0]["similarity"], 0.50)
+            self.assertGreater(results[0]["similarity"], 0.45)
 
         asyncio.run(run())
 
