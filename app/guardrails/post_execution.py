@@ -25,7 +25,7 @@ class PostExecutionGuardrail:
         "OPENAI_KEY": r"\bsk-[A-Za-z0-9_-]{20,}\b",
         "BEARER_TOKEN": r"\bBearer\s+[A-Za-z0-9_\-\.]{20,}\b",
         "GITHUB_TOKEN": r"\bgh[pousr]_[A-Za-z0-9]{36,}\b",
-        "GOOGLE_API_KEY": r"\bAIza[0-9A-Za-z-_]{35}\b",
+        "GOOGLE_API_KEY": r"\bAIza[0-9A-Za-z-_]{30,45}\b",
         "AWS_ACCESS_KEY": r"\bAKIA[0-9A-Z]{16}\b",
         "SSN": r"\b\d{3}-\d{2}-\d{4}\b",
         "CREDIT_CARD_VISA": r"\b4[0-9]{12}(?:[0-9]{3})?\b",

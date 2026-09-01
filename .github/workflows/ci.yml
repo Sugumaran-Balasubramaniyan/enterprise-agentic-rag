@@ -7,18 +7,22 @@ on:
     branches: [ main ]
 
 jobs:
-  test:
-    name: Test & Lint Suite
+  test-and-eval:
+    name: Test & Evaluation Matrix (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
 
     steps:
-      - name: Checkout code
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
+      - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
           cache: "pip"
 
       - name: Install dependencies
@@ -26,6 +30,14 @@ jobs:
           python -m pip install --upgrade pip
           if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
 
-      - name: Run Test Suite
+      - name: Run Pytest Test Suite
         run: |
-          python -m unittest discover -s tests -p "test_*.py" -v
+          pytest -v --tb=short
+
+      - name: Run Vector Retrieval Latency Benchmark
+        run: |
+          python3 benchmarks/latency_benchmark.py
+
+      - name: Run Grounding & Safety Evaluation Harness
+        run: |
+          python3 benchmarks/grounding_eval.py
