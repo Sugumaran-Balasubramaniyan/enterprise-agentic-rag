@@ -12,3 +12,6 @@ dist/
 build/
 *.egg-info/
 .DS_Store
+logs/
+audit.log
+*.log
