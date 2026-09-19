@@ -192,10 +192,45 @@ class PGVectorStore:
             async with engine.begin() as conn:
                 await conn.execute(text("CREATE EXTENSION IF NOT EXISTS vector"))
                 await conn.run_sync(Base.metadata.create_all)
+                # Create the HNSW index for the embedding column (best-effort).
+                await self.ensure_indexes(conn)
             self._postgres_available = True
             return True
         except Exception:
             self._postgres_available = False
+            return False
+
+    async def ensure_indexes(self, conn_or_session) -> bool:
+        """
+        Creates the PostgreSQL pgvector HNSW index on the document_chunks.embedding
+        column if it does not already exist.
+
+        pgvector HNSW best practices:
+        - HNSW trades a small insertion-time cost for sub-linear ANN lookup, ideal for
+          large tables. m=16 and ef_construction=64 are sensible defaults for accuracy.
+        - Cosine distance should be used (vector_cosine_ops) for normalized embeddings,
+          which is exactly what our EmbeddingService produces.
+        - At query time the recall/speed trade-off can be tuned per statement without
+          rebuilding the index:  ``SET LOCAL hnsw.ef_search = 100;``  (blocking: use
+          `concurrent_setting` inside parallel workers, or set it per session).
+        - Set `SET LOCAL hnsw.ef_search` right before a query on the same session to
+          raise recall for exact/near-exact lookups; higher values cost latency.
+
+        Accepts either an async SQLAlchemy Connection (as used by ``init_db``) or an
+        AsyncSession. Returns True if created/already present, False on error.
+        """
+        if not HAS_SQLALCHEMY or DocumentChunk is None:
+            return False
+        try:
+            stmt = text(
+                "CREATE INDEX IF NOT EXISTS idx_document_chunks_embedding_hnsw "
+                "ON document_chunks USING hnsw (embedding vector_cosine_ops) "
+                "WITH (m = 16, ef_construction = 64)"
+            )
+            await conn_or_session.execute(stmt)
+            return True
+        except Exception:
+            # Index creation is best-effort; the store still works without it.
             return False
 
     def is_postgres_active(self) -> bool:
@@ -413,6 +448,155 @@ class PGVectorStore:
 
         return base_score
 
+    async def _postgres_hybrid_search(
+        self,
+        query_text: str,
+        query_vector: List[float],
+        limit: int = 4,
+        department: Optional[str] = None,
+        metadata_filter: Optional[Dict[str, Any]] = None,
+        threshold: Optional[float] = None,
+        rrf_k: int = 60,
+        alpha: float = 0.5
+    ) -> List[Dict[str, Any]]:
+        """
+        PostgreSQL-native hybrid search: fuses a pgvector cosine dense ranking with a
+        PostgreSQL tsvector/ts_rank_cd sparse ranking using Reciprocal Rank Fusion.
+
+        Both branches apply the same department/metadata WHERE filters. Top-N per branch
+        is ``limit * 10`` (floor 100) before fusion, matching the pool-ratio guidance so
+        the stackers keep reasonable recall without scanning the whole table.
+        """
+        if not query_text or not query_text.strip():
+            return []
+
+        top_n = max(limit * 10, 100)
+
+        async with self.session_factory() as session:
+            # ---------- Dense branch: pgvector cosine similarity ----------
+            distance = DocumentChunk.embedding.cosine_distance(query_vector)
+            dense_stmt = (
+                select(
+                    DocumentChunk.id,
+                    DocumentChunk.document_id,
+                    DocumentChunk.content,
+                    DocumentChunk.metadata_,
+                    (1.0 - distance).label("similarity")
+                )
+                .order_by(distance)
+                .limit(top_n)
+            )
+            dense_stmt = self._apply_postgres_filters(dense_stmt, department, metadata_filter)
+            res = await session.execute(dense_stmt)
+            dense_rows = res.all()
+
+            dense_by_id = {}
+            dense_order = []
+            for chunk_id, doc_id, content, meta, sim in dense_rows:
+                dense_by_id[chunk_id] = {
+                    "id": chunk_id,
+                    "document_id": doc_id,
+                    "content": content,
+                    "similarity": float(sim),
+                    "metadata": meta or {},
+                }
+                dense_order.append(chunk_id)
+
+            # ---------- Sparse branch: PostgreSQL tsvector full-text ----------
+            sparse_sql, sparse_params = self._build_sparse_query(
+                query_text, top_n, department, metadata_filter
+            )
+            sparse_map = {}
+            sparse_order = []
+            if sparse_sql is not None:
+                sres = await session.execute(text(sparse_sql), sparse_params)
+                for chunk_id, sparse_score in sres.all():
+                    sparse_map[str(chunk_id)] = float(sparse_score)
+                    sparse_order.append(str(chunk_id))
+
+        # Compose the union of candidate ids from both branches.
+        all_ids = list(dict.fromkeys(dense_order + sparse_order))
+
+        dense_ranks = {cid: i + 1 for i, cid in enumerate(dense_order)}
+        sparse_ranks = {cid: i + 1 for i, cid in enumerate(sparse_order)}
+
+        fused = []
+        for cid in all_ids:
+            dense_rec = dense_by_id.get(cid)
+            sim = dense_rec["similarity"] if dense_rec else 0.0
+            if threshold is not None and sim < threshold:
+                continue
+
+            vrank = dense_ranks.get(cid, top_n + 1)
+            lrank = sparse_ranks.get(cid, top_n + 1)
+
+            rrf_score = (alpha / (rrf_k + vrank)) + ((1.0 - alpha) / (rrf_k + lrank))
+
+            fused.append({
+                "id": cid,
+                "document_id": dense_rec["document_id"] if dense_rec else "",
+                "content": dense_rec["content"] if dense_rec else "",
+                "similarity": round(sim, 4),
+                "rrf_score": round(rrf_score, 6),
+                "lexical_score": round(
+                    self._lexical_score(query_text, dense_rec["content"]) if dense_rec and dense_rec["content"] else 0.0,
+                    4,
+                ),
+                "sparse_score": round(sparse_map.get(cid, 0.0), 4),
+                "metadata": dense_rec["metadata"] if dense_rec else {},
+            })
+
+        fused.sort(key=lambda x: (x["rrf_score"], x["similarity"]), reverse=True)
+        return fused[:limit]
+
+    def _apply_postgres_filters(self, stmt, department, metadata_filter):
+        """
+        Applies department and arbitrary metadata equality filters to a SQLAlchemy
+        select statement querying the DocumentChunk JSON ``metadata`` column.
+        """
+        if department is not None:
+            stmt = stmt.where(DocumentChunk.metadata_["department"].as_string() == department)
+        if metadata_filter:
+            for k, v in metadata_filter.items():
+                stmt = stmt.where(DocumentChunk.metadata_[k].as_string() == str(v))
+        return stmt
+
+    @staticmethod
+    def _build_sparse_query(query_text, top_n, department=None, metadata_filter=None):
+        """
+        Builds a raw PostgreSQL full-text search statement over document_chunks.
+
+        Uses ``websearch_to_tsquery`` (operator-aware, safe against wildcard-injection
+        syntax errors) matched against ``to_tsvector('english', content)``, ranked by
+        ``ts_rank_cd`` (document-length-aware rank). Department/metadata filters are
+        injected as parameterized equality predicates on the JSON ``metadata`` column.
+        """
+        filters = []
+        params = {"query": query_text, "top_n": top_n}
+
+        if department is not None:
+            filters.append("metadata->>'department' = :dept")
+            params["dept"] = department
+
+        if metadata_filter:
+            for k, v in metadata_filter.items():
+                key = re.sub(r"[^A-Za-z0-9_]", "_", str(k)) or "key"
+                filters.append(f"metadata->>:{key}_k = :{key}_v")
+                params[f"{key}_k"] = str(k)
+                params[f"{key}_v"] = str(v)
+
+        where = " AND ".join(filters)
+        sql = (
+            "SELECT id, ts_rank_cd(to_tsvector('english', content), "
+            "websearch_to_tsquery('english', :query)) AS sparse_score "
+            "FROM document_chunks "
+            "WHERE websearch_to_tsquery('english', :query) @@ "
+            "to_tsvector('english', content)"
+            + (f" AND {where}" if where else "")
+            + " ORDER BY sparse_score DESC LIMIT :top_n"
+        )
+        return sql, params
+
     async def hybrid_search(
         self,
         query_text: str,
@@ -428,12 +612,40 @@ class PGVectorStore:
         Executes Reciprocal Rank Fusion (RRF) Hybrid Search combining:
         1. Dense semantic vector similarity
         2. Lexical keyword relevance
-        
+
+        When PostgreSQL + PGVector is active, this runs native PG hybrid search:
+          - Dense branch:  pgvector cosine_distance (1 - distance = cosine similarity)
+          - Sparse branch: PostgreSQL tsvector full-text search via
+            ``to_tsvector('english', content)`` ranked with ``ts_rank_cd``.
+        The two branch rankings are fused with RRF (alpha weights) exactly like the
+        in-memory path, so results carry the same dict fields, plus a ``sparse_score``
+        reflecting the ts_rank_cd value.
+
+        If PostgreSQL is unavailable or a query fails, falls back to the pure in-memory
+        implementation (identical signature and output format).
+
         RRF Score Formula:
             RRF(d) = alpha / (rrf_k + rank_vector(d)) + (1 - alpha) / (rrf_k + rank_lexical(d))
         """
         if query_vector is None:
             query_vector = await self.embedding_service.get_embedding(query_text)
+
+        # PostgreSQL-native hybrid search path (additive; in-memory behavior preserved
+        # exactly below).
+        if self.is_postgres_active() and HAS_SQLALCHEMY and DocumentChunk is not None:
+            try:
+                return await self._postgres_hybrid_search(
+                    query_text=query_text,
+                    query_vector=query_vector,
+                    limit=limit,
+                    department=department,
+                    metadata_filter=metadata_filter,
+                    threshold=threshold,
+                    rrf_k=rrf_k,
+                    alpha=alpha,
+                )
+            except Exception:
+                self._postgres_available = False
 
         # Filter candidate pool
         filtered_chunks = [
