@@ -1,4 +1,4 @@
-.PHONY: install test benchmark eval run ui lint docker-up docker-down
+.PHONY: install test benchmark eval eval-rag run ui lint docker-up docker-down
 
 install:
 	pip install -r requirements.txt
@@ -11,6 +11,9 @@ benchmark:
 
 eval:
 	python3 benchmarks/grounding_eval.py
+
+eval-rag:
+	python3 benchmarks/rag_eval.py
 
 run:
 	uvicorn app.main:app --reload --port 8000

@@ -41,3 +41,7 @@ jobs:
       - name: Run Grounding & Safety Evaluation Harness
         run: |
           python3 benchmarks/grounding_eval.py
+
+      - name: Run RAG Evaluation Harness
+        run: |
+          python3 benchmarks/rag_eval.py --provider mock

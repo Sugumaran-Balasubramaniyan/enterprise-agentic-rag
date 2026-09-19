@@ -145,7 +145,7 @@ def calculate_percentiles(latencies: List[float]) -> Dict[str, float]:
 
 
 def run_benchmark(
-    corpus_size: int = 1000,
+    corpus_size: int = 10_000,
     num_queries: int = 1000,
     dimension: int = 1536
 ) -> Dict[str, Any]:
@@ -169,7 +169,7 @@ def run_benchmark(
     flat_latencies = benchmark_flat_scan(corpus, queries, top_k=5)
     flat_stats = calculate_percentiles(flat_latencies)
 
-    print("⚡ Executing HNSW Graph Index benchmark (1,000 queries)...")
+    print("⚡ Executing HNSW Graph Simulation benchmark (1,000 queries)...")
     hnsw_latencies = benchmark_hnsw_simulation(corpus, queries, top_k=5, m=16, ef_search=32)
     hnsw_stats = calculate_percentiles(hnsw_latencies)
 
@@ -197,7 +197,7 @@ def run_benchmark(
         f"{flat_stats['qps']:<16.1f}"
     )
     print(
-        f"{'PGVector HNSW Index':<24} | "
+        f"{'HNSW Graph Simulation':<24} | "
         f"{hnsw_stats['p50']:<9.3f} | "
         f"{hnsw_stats['p95']:<9.3f} | "
         f"{hnsw_stats['p99']:<9.3f} | "
