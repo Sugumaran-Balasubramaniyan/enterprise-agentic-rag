@@ -8,7 +8,9 @@
 [![Docker](https://img.shields.io/badge/Docker-Containerized-2496ED.svg?logo=docker)](https://docker.com)
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](LICENSE)
 
-An enterprise-grade, production-hardened **Agentic Retrieval-Augmented Generation (RAG)** platform engineered for high-concurrency enterprise knowledge management. It integrates **PostgreSQL (`pgvector` with HNSW indexing)**, an autonomous **Multi-Step Agent Orchestrator with dynamic tool dispatching**, multi-modal document ingestion & OCR remediation, and **Two-Stage Deterministic Guardrails** that guarantee 100% defense against prompt injections, data exfiltration, and hallucinations.
+An enterprise-grade, production-hardened **Agentic Retrieval-Augmented Generation (RAG)** platform engineered for high-concurrency enterprise knowledge management. It integrates **PostgreSQL (`pgvector` with HNSW indexing)**, an autonomous **Multi-Step Agent Orchestrator with a pluggable agentic LLM loop**, multi-modal document ingestion & OCR remediation, and **Two-Stage Deterministic Guardrails** that guarantee defense against prompt injections, data exfiltration, and hallucinations.
+
+> **Pluggable providers (v0.2.0):** the LLM and embedding layers are provider-agnostic. `LLM_PROVIDER=mock` is the **offline-safe default** (no network, no keys), and you can swap in real providers such as **OpenAI** and **OpenRouter**, with pluggable embeddings (e.g. OpenAI `text-embedding-3`), without changing application code.
 
 ---
 
@@ -101,7 +103,7 @@ sequenceDiagram
 ## 🚀 Core Capabilities
 
 ### 1. High-Performance PGVector HNSW & Hybrid RRF Retrieval
-* **PGVector HNSW Graph Indexing:** Uses native PostgreSQL 16 + `pgvector` with Hierarchical Navigable Small World graphs (`m=16, ef_construction=64, ef_search=32`), achieving sub-20ms median latency across multi-million vector datasets.
+* **PGVector HNSW Graph Indexing:** Uses native PostgreSQL 16 + `pgvector` with Hierarchical Navigable Small World graphs (`m=16, ef_construction=64, ef_search=32`), designed for sub-20ms median latency across multi-million vector datasets. Index creation is managed via `ensure_indexes()`.
 * **Reciprocal Rank Fusion (RRF):** Combines dense vector cosine similarity with PostgreSQL `tsvector` lexical keyword search ($k=60$) for optimal domain-specific and technical query recall.
 * **Transparent Dual-Engine Fallback:** Automatically operates against PostgreSQL or seamlessly transitions to an in-memory SIMD/NumPy accelerated vector store if the database connection is offline.
 
@@ -130,6 +132,30 @@ sequenceDiagram
 * **Interactive Tool Audit Cards:** Expandable traces displaying step-by-step tool inputs, latencies in milliseconds, and outputs.
 * **Tenant & Department Governance:** Scoped metadata filters across Platform Engineering, Data Engineering, Security & Compliance, and Finance.
 
+### 6. Pluggable LLM & Embedding Providers
+* **Pluggable agentic LLM loop:** the orchestrator drives the multi-step tool loop over swappable LLM backends instead of a hard-coded script — choose **mock** (offline, deterministic, key-free) or real providers such as **OpenAI** and **OpenRouter** via `LLM_PROVIDER`.
+* **Pluggable embeddings:** the embedding engine is provider-agnostic and supports real embedding models (e.g. OpenAI `text-embedding-3`) in addition to the built-in deterministic fallback, with the dimension configured via `EMBEDDING_DIMENSION`.
+
+### 7. PG-Native Hybrid Search (tsvector + RRF)
+* **Lexical backbone in PostgreSQL:** semantic dense search is fused with PostgreSQL-native `tsvector` full-text search — not just an in-memory keyword scorer — so hybrid retrieval survives into the PG-backed path.
+* **Reciprocal Rank Fusion:** dense and lexical result sets are merged by rank (`k=60`, `alpha=0.5`) for robust recall on technical and keyword-dense enterprise queries.
+
+### 8. Query Transformation
+* **Pluggable query pipelines:** the retrieval stage supports query **rewrite**, **multi-query expansion**, and **HyDE**-style hypothetical-document embeddings to disambiguate conversational or underspecified questions and broaden recall before the fused search runs.
+
+### 9. Reranking
+* **Post-retrieval reranking:** the fused top-k can pass through a cross-encoder-style reranker to tighten precision between retrieval and generation, ensuring the most relevant passages surface for the grounded answer.
+
+### 10. Semantic Caching
+* **Cache-aware retrieval responses:** repeated or near-duplicate queries can be served from a semantic cache, cutting provider cost and latency without weakening the guardrail stack.
+
+### 11. Observability
+* **Full request traceability:** per-step `ToolExecutionTrace`, latency percentiles, guardrail block events, and active-backend status are exposed through `/api/v1/metrics` and the Streamlit mission-control audit cards.
+* **Structured metrics:** query volume, blocked queries, avg/P95 latency, document & chunk counts are available as first-class telemetry.
+
+### 12. Evaluation Harness (RAGAS-style Metrics)
+* **Measurement, not eyeballing:** `benchmarks/rag_eval.py` reports retrieval metrics (hit@k, MRR, recall@k), grounding/faithfulness, and citation coverage over a 20-question golden dataset with a CI gate — plus optional LLM-judge answer relevancy when a real `openai` provider is configured (`make eval-rag`).
+
 ---
 
 ## ⚡ Benchmark Results & Reproducibility
@@ -138,16 +164,26 @@ The repository includes standalone benchmarking and evaluation suites for verifi
 
 ### 1. Vector Retrieval Latency Benchmark (`benchmarks/latency_benchmark.py`)
 
-Executes 1,000 synthetic vector queries against 1536-dimensional embeddings comparing Flat Sequential Scan against PGVector HNSW Graph indexing:
+Executes 1,000 synthetic vector queries against 1536-dimensional embeddings comparing Flat Sequential Scan against an HNSW-style graph navigation simulation (NumPy; `m=16, ef_search=32`) over a 10,000-vector corpus:
 
 ```bash
 python3 benchmarks/latency_benchmark.py
 ```
 
+> ⚠️ **Honest framing:** this microbenchmark is a seeded NumPy *simulation* of HNSW's
+> neighbor-sampling strategy — it is *not* a real pgvector index (those live in
+> `PGVectorStore` via `ensure_indexes()` and require the Postgres stack). Numbers are
+> hardware-dependent; re-run on your own machine. Representative measurement
+> (Oracle Ampere ARM64, 2026-09-19):
+
 | Index Architecture | p50 Latency (ms) | p95 Latency (ms) | p99 Latency (ms) | Mean Latency (ms) | Throughput (QPS) |
 |:---|:---:|:---:|:---:|:---:|:---:|
-| **Flat Sequential Scan** | 8.333 ms | 17.492 ms | 26.052 ms | 9.875 ms | 101.3 QPS |
-| **PGVector HNSW Index** (`m=16, ef=64`) | **3.619 ms** | **6.680 ms** | **11.505 ms** | **4.275 ms** | **233.9 QPS** |
+| **Flat Sequential Scan** | 0.072 ms | 2.993 ms | 3.711 ms | 0.509 ms | 1965.5 QPS |
+| **HNSW Graph Simulation** (`m=16, ef=32`) | 0.293 ms | 0.379 ms | 1.191 ms | 0.414 ms | 2413.6 QPS |
+
+The simulation demonstrates the expected ANN trade-off: ~4x tighter tail latency on a
+10k-vector corpus, with the gap widening as corpus size grows (flat scan is O(N) per
+query; HNSW navigation is O(log N)).
 
 ---
 
@@ -211,6 +247,40 @@ uvicorn app.main:app --reload --port 8000
 # 6. Launch Streamlit UI (in separate terminal)
 streamlit run streamlit_app.py --server.port 8501
 ```
+
+### Configuring LLM & Embedding Providers
+
+`LLM_PROVIDER` defaults to `mock`, which is **offline-safe** — it requires no API keys, makes no network
+calls, and is fully deterministic, making it ideal for CI and local demos. The default `.env` works
+out of the box:
+
+```bash
+# Offline-safe default (no keys required)
+LLM_PROVIDER=mock
+```
+
+To enable a real, pluggable LLM backend on top of the agentic loop:
+
+```bash
+# OpenAI
+LLM_PROVIDER=openai
+OPENAI_API_KEY=sk-...          # store outside version control
+
+# or OpenRouter (larger model catalog via a single endpoint)
+LLM_PROVIDER=openrouter
+OPENROUTER_API_KEY=sk-or-...
+```
+
+Pluggable embeddings follow the same pattern. To use OpenAI `text-embedding-3` (1536-dim) instead of
+the built-in deterministic fallback, supply the embedding API key and confirm the dimension:
+
+```bash
+EMBEDDING_DIMENSION=1536
+# embedding provider key injected via secrets; never commit keys
+```
+
+> **Note:** never commit a real `.env` or API keys — `.env` is git-ignored and secrets must be injected
+> at deploy time (see [SECURITY.md](SECURITY.md)).
 
 ---
 
@@ -397,6 +467,29 @@ make lint        # Run code linter
 make docker-up   # Start Docker Compose services
 make docker-down # Stop Docker Compose services
 ```
+
+---
+
+## 📚 Research & Design
+
+Understand the *why* behind the architecture and where the project is headed:
+
+* **[docs/RESEARCH.md](docs/RESEARCH.md)** — a research notebook covering the architecture layers, the key
+  referenced papers (Self-RAG, CRAG, Adaptive-RAG, RAG-Fusion, ReAct, GraphRAG, LightRAG, contextual
+  retrieval, OWASP LLM Top 10, and RAGAS), the explicit design tensions, and the forward roadmap
+  (GraphRAG via LightRAG, an MCP server, and a deep-research mode).
+* **[docs/GAP_ANALYSIS.md](docs/GAP_ANALYSIS.md)** — a cited state-of-the-art gap analysis grounding the
+  roadmap in the 2025–2026 literature.
+
+---
+
+## 🏛️ Repository Quality
+
+* **[CONTRIBUTING.md](CONTRIBUTING.md)** — development setup, test/lint workflow, PR process, conventional
+  commits, and the DCO sign-off requirement.
+* **[SECURITY.md](SECURITY.md)** — private vulnerability disclosure, the deterministic security posture
+  (guardrails, PII sanitization, RBAC, no secrets in env files), and supported versions.
+* **[LICENSE](LICENSE)** — licensed under the Apache License, Version 2.0.
 
 ---
 
