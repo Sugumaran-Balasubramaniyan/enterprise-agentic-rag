@@ -1,0 +1,9 @@
+# Optional production extras (not required for core app / tests).
+# Install when you need these features: pip install -r requirements-extras.txt
+sentence-transformers
+redis
+slowapi
+presidio-analyzer
+presidio-anonymizer
+pyjwt
+tenacity

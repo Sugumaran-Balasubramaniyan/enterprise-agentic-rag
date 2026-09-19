@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "enterprise-agentic-rag"
-version = "0.1.0"
+version = "0.2.0"
 description = "Enterprise Agentic RAG with PGVector Semantic Retrieval and Deterministic Guardrails"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -26,6 +26,17 @@ dependencies = [
     "pytest>=8.0.0",
     "pytest-asyncio>=0.23.0",
     "streamlit>=1.32.0"
+]
+
+[project.optional-dependencies]
+extras = [
+    "sentence-transformers",
+    "redis",
+    "slowapi",
+    "presidio-analyzer",
+    "presidio-anonymizer",
+    "pyjwt",
+    "tenacity"
 ]
 
 [tool.pytest.ini_options]
